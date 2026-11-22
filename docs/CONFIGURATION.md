@@ -41,12 +41,14 @@ value.
 | `CONCORD_PASSWORD_COST` | `32768:8:3` | `N:r:p`: N a power of two from 16384 to 1048576, r from 8 to 32, p from 1 to 16 | N, r or p is missing or out of range, or the factors need more than 128 MiB of scrypt memory |
 | `CONCORD_GOOGLE_CLIENT_ID` | Unset (Google sign-in off) | An OAuth client id | Only one of the pair is set |
 | `CONCORD_GOOGLE_CLIENT_SECRET` | Unset (Google sign-in off) | That client's secret | Only one of the pair is set |
+| `CONCORD_GOOGLE_CLIENT_SECRET_FILE` | Unset | Path to a file holding the client secret (Docker or Kubernetes secret mount); one trailing newline is dropped | Set together with `CONCORD_GOOGLE_CLIENT_SECRET`, empty, or the file cannot be read |
 | `CONCORD_DEFAULT_NETWORK` | `mainnet` | `mainnet` or `testnet` | Anything else, including an empty value |
 | `CONCORD_MAINNET_RPC_URLS` | Three free public endpoints (below) | Comma-separated `http`/`https` URLs | Any entry is not an `http`/`https` URL |
 | `CONCORD_TESTNET_RPC_URLS` | `https://soroban-testnet.stellar.org` | As above | As above |
 | `CONCORD_MAINNET_HORIZON_URLS` | `https://horizon.stellar.org` | As above | As above |
 | `CONCORD_TESTNET_HORIZON_URLS` | `https://horizon-testnet.stellar.org` | As above | As above |
 | `CONCORD_RPC_HEADERS` | None | JSON: `{"<host>": {"<header>": "<value>"}}` | Not valid JSON, or a host does not map to an object of string header values |
+| `CONCORD_RPC_HEADERS_FILE` | Unset | Path to a file holding the `CONCORD_RPC_HEADERS` JSON; one trailing newline is dropped | Set together with `CONCORD_RPC_HEADERS`, empty, the file cannot be read, or its contents fail the checks above |
 | `CONCORD_USER_AGENT_SUFFIX` | Unset (no suffix) | A contact string, at most 120 printable ASCII characters, e.g. an email address. Appended to the User-Agent on RPC and Horizon requests | Longer than 120 characters, or a character outside printable ASCII |
 | `CONCORD_SYNC_INTERVAL` | `30` | Seconds between indexer passes. `0` turns the indexer off | Not a whole number, or below 0 |
 | `CONCORD_ORG` | None | A workspace id, or a workspace's exact name | When a command needs a workspace and the value matches none, or matches more than one by name |
