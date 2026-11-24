@@ -100,14 +100,14 @@ importers:
         specifier: workspace:*
         version: link:../../packages/core
       '@hono/node-server':
-        specifier: ^2.1.6
-        version: 2.1.6(hono@4.13.16)
+        specifier: ^2.1.11
+        version: 2.1.11(hono@4.13.19)
       '@stellar/stellar-sdk':
         specifier: ^17.4.0
         version: 17.4.0
       hono:
-        specifier: ^4.13.16
-        version: 4.13.16
+        specifier: ^4.13.19
+        version: 4.13.19
     devDependencies:
       '@types/node':
         specifier: ^22.20.0
@@ -489,8 +489,8 @@ packages:
       '@noble/hashes':
         optional: true
 
-  '@hono/node-server@2.1.6':
-    resolution: {integrity: sha512-p/KH9MnfNcsm3sR6x4lNgm5j+QN4Et8srKredl9DZfXiyZ1UQ3aQ2YVpFLbqktYN5JI+DB+VZFKM2PqE5hLKjQ==}
+  '@hono/node-server@2.1.11':
+    resolution: {integrity: sha512-KzKz9vl4vvr1vgLHamj+g5uonbrj5NwAdO3yzOS6cd2HjALVeOgTgeZOyAzNxejbkfOOPIcvuf/Tg8l1pEFLog==}
     engines: {node: '>=20'}
     peerDependencies:
       hono: ^4 || ^5.0.0-0
@@ -1323,8 +1323,8 @@ packages:
   hermes-parser@0.25.1:
     resolution: {integrity: sha512-6pEjquH3rqaI6cYAXYPcz9MS4rY6R4ngRgrgfDshRptUZIc3lw0MCIJIGDj9++mfySOuPTHB4nrSW99BCvOPIA==}
 
-  hono@4.13.16:
-    resolution: {integrity: sha512-AOLOEhvrV+iH92xXCnFr/5+3KjPKcI3xP63XJtX5spAnkznPdHijlIsUTpi7/9EhWqrTCekw5c5zh1K+YsVw7A==}
+  hono@4.13.19:
+    resolution: {integrity: sha512-KmXvQAXwcAHV+muzbIwoJ23niEB5nMoDVr9WcRkU8mvjUECm/1+7v4Jgp7P7a+H6MLFrh+vXrGonGrGS+RQfkA==}
     engines: {node: '>=16.9.0'}
 
   hookified@1.15.1:
@@ -2332,9 +2332,9 @@ snapshots:
     optionalDependencies:
       '@noble/hashes': 2.4.0
 
-  '@hono/node-server@2.1.6(hono@4.13.16)':
+  '@hono/node-server@2.1.11(hono@4.13.19)':
     dependencies:
-      hono: 4.13.16
+      hono: 4.13.19
 
   '@humanfs/core@0.19.2':
     dependencies:
@@ -3142,7 +3142,7 @@ snapshots:
     dependencies:
       hermes-estree: 0.25.1
 
-  hono@4.13.16: {}
+  hono@4.13.19: {}
 
   hookified@1.15.1: {}
 
