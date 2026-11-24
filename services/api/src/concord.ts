@@ -77,6 +77,8 @@ export interface AssetRecord {
   syncError?: string;
   syncErrorAt?: string;
   ignore: string[];
+  instructionWindowHours: number;
+  movementWindowHours: number;
   createdAt: string;
 }
 
@@ -93,6 +95,8 @@ export interface WatchInput {
   baseline?: boolean;
   /** Addresses outside the register, e.g. the issuer's distribution account. */
   ignore?: string[];
+  instructionWindowHours?: number;
+  movementWindowHours?: number;
 }
 
 export type ActionType = "dividend" | "split" | "redemption";
@@ -191,6 +195,18 @@ interface ActionResult {
 const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
+const DEFAULT_INSTRUCTION_WINDOW_HOURS = 72;
+const DEFAULT_MOVEMENT_WINDOW_HOURS = 24;
+const MIN_WINDOW_HOURS = 1;
+const MAX_WINDOW_HOURS = 720;
+
+function windowHours(value: number | undefined, field: string, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < MIN_WINDOW_HOURS || value > MAX_WINDOW_HOURS) {
+    throw new Invalid(`${field} must be an integer between ${MIN_WINDOW_HOURS} and ${MAX_WINDOW_HOURS}`);
+  }
+  return value;
+}
 
 const HTML_ESCAPES: Record<string, string> = {
   "&": "&amp;",
@@ -308,6 +324,8 @@ function toAsset(row: Row): AssetRecord {
     state: String(row.state) as AssetRecord["state"],
     startMode: String(row.start_mode) as AssetRecord["startMode"],
     ignore: JSON.parse(String(row.ignore_addresses)) as string[],
+    instructionWindowHours: Number(row.instruction_window_hours ?? DEFAULT_INSTRUCTION_WINDOW_HOURS),
+    movementWindowHours: Number(row.movement_window_hours ?? DEFAULT_MOVEMENT_WINDOW_HOURS),
     createdAt: String(row.created_at),
   };
   if (row.issuer) asset.issuer = String(row.issuer);
@@ -441,6 +459,8 @@ export class Concord {
       throw new Invalid(`${resolved.code} is already watched`);
     }
     const ignore = addresses(input.ignore, "ignore");
+    const instructionWindowHours = windowHours(input.instructionWindowHours, "instructionWindowHours", DEFAULT_INSTRUCTION_WINDOW_HOURS);
+    const movementWindowHours = windowHours(input.movementWindowHours, "movementWindowHours", DEFAULT_MOVEMENT_WINDOW_HOURS);
     let name = label(input.name, "name");
     let decimals = input.decimals;
     if (input.fromLedger !== undefined && (!Number.isInteger(input.fromLedger) || input.fromLedger < 1)) {
@@ -484,8 +504,8 @@ export class Concord {
     }
     try {
       this.db.insert(
-        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?)`,
+        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, instruction_window_hours, movement_window_hours, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?, ?, ?)`,
         resolved.id,
         input.network,
         resolved.code,
@@ -495,6 +515,8 @@ export class Concord {
         startMode,
         input.fromLedger ?? null,
         JSON.stringify(ignore),
+        instructionWindowHours,
+        movementWindowHours,
         options.actor?.label ?? null,
         now(),
       );
@@ -566,13 +588,24 @@ export class Concord {
     return this.asset(asset.id);
   }
 
-  updateAsset(ref: string, patch: { name?: string; ignore?: string[] }): AssetRecord {
+  updateAsset(
+    ref: string,
+    patch: { name?: string; ignore?: string[]; instructionWindowHours?: number; movementWindowHours?: number },
+  ): AssetRecord {
     const asset = this.asset(ref);
     const name = label(patch.name, "name");
+    const instructionWindowHours = windowHours(
+      patch.instructionWindowHours,
+      "instructionWindowHours",
+      asset.instructionWindowHours,
+    );
+    const movementWindowHours = windowHours(patch.movementWindowHours, "movementWindowHours", asset.movementWindowHours);
     this.db.write(
-      "UPDATE assets SET name = ?, ignore_addresses = ? WHERE id = ?",
+      "UPDATE assets SET name = ?, ignore_addresses = ?, instruction_window_hours = ?, movement_window_hours = ? WHERE id = ?",
       name ?? asset.name,
       JSON.stringify(patch.ignore === undefined ? asset.ignore : addresses(patch.ignore, "ignore")),
+      instructionWindowHours,
+      movementWindowHours,
       asset.id,
     );
     return this.asset(asset.id);
@@ -1280,6 +1313,7 @@ export class Concord {
       });
       const result = reconcileMovements(scoped, scopedJournal, {
         to: asOf,
+        windowMs: asset.movementWindowHours * 3600_000,
         ...(previous ? { from: new Date(Date.parse(previous.as_of) + 1).toISOString() } : {}),
       });
       movement = { from: previous?.as_of ?? null, to: asOf, ...result.summary, matches: result.matches };
@@ -2120,6 +2154,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       instructionList.filter((i) => !window || Date.parse(i.issuedAt) <= Date.parse(window.to)),
       {
         asOf: window?.to ?? asset.syncedAt ?? new Date().toISOString(),
+        windowMs: asset.instructionWindowHours * 3600_000,
         initialFrozen,
         ...(indexedFrom ? { indexedFrom } : {}),
       },
@@ -2268,6 +2303,8 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         indexedToLedger: asset.syncedLedger ?? null,
         indexedTo: asset.syncedAt ?? null,
         ignoredAddresses: asset.ignore,
+        instructionWindowHours: asset.instructionWindowHours,
+        movementWindowHours: asset.movementWindowHours,
       },
       period: { from, to },
       holdings: (() => {
