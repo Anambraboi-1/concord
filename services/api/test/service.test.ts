@@ -747,6 +747,51 @@ describe("Concord", () => {
     expect(assetRows()).toBe(before + 1);
   });
 
+  it("refuses a fromLedger older than the RPC retains, blocking or deferred", async () => {
+    chain.oldest = 50;
+    const assetRows = () => concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM assets")!.n;
+    const before = assetRows();
+    const retained = /older than the RPC retains \(oldest 50\)/;
+
+    // Blocking: the watch rejects and rolls its row back.
+    const blocking = `OLDB:${key()}`;
+    const refused = await concord.watchAsset({ network: "testnet", asset: blocking, fromLedger: 10 }).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(Invalid);
+    expect((refused as Error).message).toMatch(retained);
+    expect(assetRows()).toBe(before);
+    expect(concord.db.get("SELECT id FROM assets WHERE code = 'OLDB'")).toBeUndefined();
+
+    // Deferred: the row is kept, still indexing, and carries the same error once its pass fails.
+    const deferred = await concord.watchAsset({ network: "testnet", asset: `OLDD:${key()}`, fromLedger: 10 }, { defer: true });
+    expect(deferred).toMatchObject({ code: "OLDD", state: "indexing" });
+    await expect(concord.sync(deferred.id)).rejects.toThrow(retained);
+    const stuck = concord.asset(deferred.id);
+    expect(stuck.state).toBe("indexing");
+    expect(stuck.syncError).toMatch(retained);
+    expect(assetRows()).toBe(before + 1);
+  });
+
+  it("refuses an asset the network does not know, with classic and contract wording, and writes no row", async () => {
+    const unknownChain = new FakeChain();
+    // An empty known set makes describe() answer undefined for everything.
+    unknownChain.known = new Set();
+    const fresh = new Concord(new Db(":memory:"), { testnet: { passphrase: PASSPHRASE, chain: unknownChain } });
+    const contractId = StrKey.encodeContract(Buffer.alloc(32, 7));
+
+    for (const options of [{}, { defer: true }]) {
+      const classic = await fresh.watchAsset({ network: "testnet", asset: `FUND:${issuer}` }, options).catch((err: unknown) => err);
+      expect(classic).toBeInstanceOf(Invalid);
+      expect((classic as Error).message).toBe("testnet has no asset FUND from that issuer");
+
+      const contract = await fresh
+        .watchAsset({ network: "testnet", asset: contractId, decimals: 7 }, options)
+        .catch((err: unknown) => err);
+      expect(contract).toBeInstanceOf(Invalid);
+      expect((contract as Error).message).toBe("testnet has no contract with that id");
+    }
+    expect(fresh.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM assets")!.n).toBe(0);
+  });
+
   it("rejects a register from another asset and an unknown register id", async () => {
     const reg = concord.importRegister("FUND", { csv: `holder_id,account,units\nA,${h1},90\n`, asOf: at(40) });
     await concord.watchAsset({ network: "testnet", asset: `OTHER:${issuer}`, fromLedger: 1 });
@@ -921,6 +966,81 @@ describe("Concord", () => {
     await concord.watchAsset({ network: "testnet", asset: `NAMED:${key()}`, fromLedger: 1 });
     concord.importInstructions("NAMED", `ref,type,account,issued_at\nI-OLD,freeze,${h1},2025-01-01T00:00:00Z\n`);
     expect(concord.controls("NAMED").breaks.map((b) => b.key)).toEqual(["UNEXECUTED_INSTRUCTION:I-OLD"]);
+  });
+
+  // In the two tests below chain.baselineResult is left unset, so FakeChain.baseline() throws
+  // "no baseline". Each uses its own empty database, so the assets table holds only what it watches.
+
+  it("removes the asset row when a blocking watch cannot take its opening balances", async () => {
+    const db = new Db(":memory:");
+    const fresh = new Concord(db, { testnet: { passphrase: PASSPHRASE, chain } });
+    const assetRows = () => db.get<{ n: number }>("SELECT COUNT(*) AS n FROM assets")!.n;
+    const asset = `OLD:${key()}`;
+
+    await expect(fresh.watchAsset({ network: "testnet", asset })).rejects.toThrow("no baseline");
+    expect(assetRows()).toBe(0);
+    expect(fresh.assets()).toEqual([]);
+
+    // Nothing is left to collide with: once opening balances can be read, the same asset is watched.
+    chain.baselineResult = { ledger: 50, openings: new Map() };
+    const watched = await fresh.watchAsset({ network: "testnet", asset });
+    expect(watched).toMatchObject({ state: "ready", startMode: "baseline", baselineLedger: 50 });
+    expect(assetRows()).toBe(1);
+  });
+
+  it("keeps a deferred watch whose opening balances fail, and records that indexing stopped", async () => {
+    const db = new Db(":memory:");
+    const fresh = new Concord(db, { testnet: { passphrase: PASSPHRASE, chain } });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Park the background pass on the baseline read, so the asset is seen before the failure lands.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let arrive!: () => void;
+    const arrived = new Promise<void>((resolve) => (arrive = resolve));
+    const baseline = chain.baseline.bind(chain);
+    let baselineReads = 0;
+    chain.baseline = async () => {
+      baselineReads++;
+      arrive();
+      await held;
+      return baseline();
+    };
+
+    try {
+      const watched = await fresh.watchAsset({ network: "testnet", asset: `OLD:${key()}` }, { defer: true });
+      expect(watched).toMatchObject({ state: "indexing", startMode: "baseline" });
+      expect(watched.syncError).toBeUndefined();
+
+      // The watch started the pass itself: it reaches the baseline read without anyone calling sync().
+      await arrived;
+      // sync() hands back that pass, still in flight, so this waits for the background pass itself.
+      const pass = fresh.sync(watched.id);
+      release();
+      await expect(pass).rejects.toThrow("no baseline");
+      expect(baselineReads).toBe(1);
+
+      // The asset stays, still indexing, with the failure on it in words fit for the dashboard.
+      const failed = fresh.asset(watched.id);
+      expect(failed).toMatchObject({
+        state: "indexing",
+        syncError: "[internal] Indexing stopped on an unexpected error.",
+      });
+      expect(failed.syncErrorAt).toEqual(expect.any(String));
+      expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM assets")!.n).toBe(1);
+      // What actually went wrong goes to the server log instead.
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect((logged.mock.calls[0]![0] as Error).message).toBe("no baseline");
+
+      // And because the asset stayed, the next pass that succeeds clears the failure.
+      chain.baselineResult = { ledger: 50, openings: new Map() };
+      await fresh.sync(watched.id);
+      const healed = fresh.asset(watched.id);
+      expect(healed).toMatchObject({ state: "ready", baselineLedger: 50 });
+      expect(healed.syncError).toBeUndefined();
+      expect(healed.syncErrorAt).toBeUndefined();
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it("snapshots at the record time and reconciles a dividend paid in another asset", async () => {
@@ -1425,6 +1545,100 @@ describe("Concord", () => {
     `);
   });
 
+  describe("exportCsv additional sections", () => {
+    beforeEach(async () => {
+      await concord.sync("FUND");
+      concord.importJournal(
+        "FUND",
+        `ref,date,type,from_account,to_account,units,tx_hash\nJ1,${at(3)},issue,,${h1},100,tx1\n`,
+      );
+      concord.importInstructions(
+        "FUND",
+        `ref,type,account,units,issued_at,approved_by,reason\nI1,authorise,${h1},,${at(1)},ops,KYC\n`,
+      );
+      const reg = concord.importRegister("FUND", {
+        csv: `holder_id,account,units,status\nA,${h1},90,active\n`,
+        asOf: at(5),
+      });
+      await concord.reconcile("FUND", reg.registerId);
+      await concord.createAction("FUND", { type: "split", recordTime: at(5), num: "2", den: "1" });
+    });
+
+    it("positions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "positions");
+      const [header, ...rows] = csv.trim().split("\n");
+      expect(header).toBe("runId,asOf,address,holderIds,chainUnits,registerUnits,difference,chainStatus,registerStatus,matched");
+      const h1Row = rows.find((r) => r.includes(h1));
+      expect(h1Row).toBeDefined();
+      expect(h1Row).toContain("90");
+    });
+
+    it("runs section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "runs");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe(
+        "id,asOf,createdAt,registerId,status,chainLedger,chainSyncedAt,chainBehind,chainSupply,registerTotal,supplyDifference,chainHolders,registerHolders,lines,matchedLines,breakCount,openBreaks",
+      );
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("breaks");
+      expect(firstRow).toContain("90");
+    });
+
+    it("actions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "actions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("id,type,label,recordTime,state,createdAt,reconciledAt,openBreaks");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("split");
+    });
+
+    it("journal section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "journal");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,date,type,from_account,to_account,units,tx_hash");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("J1");
+      expect(firstRow).toContain("100");
+    });
+
+    it("instructions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "instructions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,type,account,units,issued_at,approved_by,reason");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("I1");
+      expect(firstRow).toContain("authorize");
+    });
+
+    it("invalid-section message lists all allowed sections", () => {
+      const expectedSections = [
+        "holdings",
+        "events",
+        "controls",
+        "breaks",
+        "action",
+        "positions",
+        "runs",
+        "actions",
+        "journal",
+        "instructions",
+      ];
+      let thrown: Error | undefined;
+      try {
+        concord.exportCsv("FUND", "invalid-section");
+      } catch (err) {
+        thrown = err as Error;
+      }
+      expect(thrown).toBeInstanceOf(Invalid);
+      for (const section of expectedSections) {
+        expect(thrown!.message).toContain(section);
+      }
+      expect(thrown!.message).toBe(
+        "section must be holdings, events, controls, breaks, action, positions, runs, actions, journal or instructions",
+      );
+    });
+  });
+
   it("includes register provenance in the audit pack covering every reconciled register", async () => {
     await concord.sync("FUND");
     const reg1 = concord.importRegister(
@@ -1643,6 +1857,29 @@ describe("Concord", () => {
 
     // Asset is deleted
     expect(() => concord.asset("FUND")).toThrow(NotFound);
+  });
+
+  it("unwatchAsset waits for an in-flight sync, so no events land in the asset watched again", async () => {
+    const held = chain.hold();
+    const pass = concord.sync("FUND");
+    await held.entered;
+
+    const unwatched = concord.unwatchAsset("FUND");
+    const rewatch = () => concord.watchAsset({ network: "testnet", asset: `FUND:${issuer}`, fromLedger: 1 });
+    // While the pass is held, the old asset is still there. An unwatch that did not wait for the
+    // pass would already have deleted it, and this re-watch would succeed. The held pass would
+    // then write its page of events into the new asset.
+    const early = await rewatch().catch((err: unknown) => err);
+
+    held.release();
+    await Promise.allSettled([pass]);
+    await unwatched;
+    const fund = early instanceof Invalid ? await rewatch() : (early as Awaited<ReturnType<typeof rewatch>>);
+
+    expect(concord.events(fund.id)).toEqual([]);
+    expect(concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE asset_id = ?", fund.id)!.n).toBe(0);
+    expect(early).toBeInstanceOf(Invalid);
+    expect((early as Error).message).toBe("FUND is already watched");
   });
 
   it("rebuilds from fresh opening balances and keeps the books", async () => {
