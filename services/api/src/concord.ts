@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   buildControlsLog,
   dividendBreakdown,
@@ -205,6 +206,62 @@ interface ActionResult {
 
 const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** Version of the audit pack's shape (docs/audit-pack.schema.json); bump it on a breaking change. */
+export const AUDIT_PACK_SCHEMA_VERSION = 1;
+
+/**
+ * Serializes a value into RFC 8785 canonical JSON.
+ * - Object keys sorted lexicographically by UTF-16 code units
+ * - Primitives formatted according to ECMAScript standard JSON rules (-0 formatted as "0")
+ * - Whitespace stripped
+ * - undefined, functions, and symbols in objects omitted; in arrays rendered as null
+ */
+export function canonicalJson(value: unknown): string {
+  if (value && typeof (value as { toJSON?: unknown }).toJSON === "function") {
+    value = (value as { toJSON: () => unknown }).toJSON();
+  }
+  if (value === null || typeof value !== "object") {
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) return "null";
+      if (Object.is(value, -0)) return "0";
+      return JSON.stringify(value);
+    }
+    if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
+      return undefined as unknown as string;
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((v) => {
+      const s = canonicalJson(v);
+      return s === undefined ? "null" : s;
+    });
+    return `[${items.join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const entries: string[] = [];
+  for (const k of keys) {
+    const val = obj[k];
+    if (val === undefined || typeof val === "function" || typeof val === "symbol") continue;
+    const json = canonicalJson(val);
+    if (json !== undefined) {
+      entries.push(`${JSON.stringify(k)}:${json}`);
+    }
+  }
+  return `{${entries.join(",")}}`;
+}
+
+/**
+ * Computes the SHA-256 digest of an audit pack over RFC 8785 canonical JSON,
+ * excluding volatile/digest fields sha256 and generatedAt.
+ */
+export function auditPackDigest(pack: Record<string, unknown>): string {
+  // The signature fields are added after the digest is taken, so they are never part of it.
+  const { sha256: _sha256, generatedAt: _generatedAt, keyId: _keyId, signature: _signature, ...content } = pack;
+  return sha256(canonicalJson(content));
+}
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
 const DEFAULT_INSTRUCTION_WINDOW_HOURS = 72;
 const DEFAULT_MOVEMENT_WINDOW_HOURS = 24;
@@ -267,6 +324,22 @@ const SUMMARY_LABELS: Record<string, string> = {
   matchedLines: "Matched lines",
   breakCount: "Breaks",
 };
+
+export const EXPORT_CSV_SECTIONS = [
+  "holdings",
+  "events",
+  "controls",
+  "breaks",
+  "action",
+  "positions",
+  "runs",
+  "actions",
+  "journal",
+  "instructions",
+] as const;
+export const EXPORT_CSV_SECTION_ERROR =
+  "section must be holdings, events, controls, breaks, action, positions, runs, actions, journal or instructions";
+export type ExportCsvSection = (typeof EXPORT_CSV_SECTIONS)[number];
 
 function isoTime(input: string, field: string): string {
   const t = Date.parse(input);
@@ -480,6 +553,18 @@ function resume(
  * One workspace: every operation the API and the CLI expose over a single database.
  * Reads the chain, never writes it.
  */
+export const EVENT_COLUMNS = [
+  "id",
+  "ledger",
+  "closedAt",
+  "kind",
+  "from",
+  "to",
+  "units",
+  "authorized",
+  "txHash",
+] as const;
+
 export class Concord {
   private readonly syncing = new Map<string, Promise<{ added: number }>>();
   private readonly removing = new Set<string>();
@@ -491,7 +576,7 @@ export class Concord {
   constructor(
     readonly db: Db,
     readonly networks: Networks,
-    options: { checkpointEvery?: number } = {},
+    readonly options: { checkpointEvery?: number; signingKey?: string } = {},
   ) {
     this.seenVersion = db.dataVersion();
     const every = options.checkpointEvery ?? CHECKPOINT_EVERY;
@@ -1500,6 +1585,13 @@ export class Concord {
       });
   }
 
+  /** Remove a single journal entry by its ref. */
+  deleteJournalEntry(ref: string, entryRef: string): void {
+    const asset = this.asset(ref);
+    const removed = this.db.write("DELETE FROM journal WHERE asset_id = ? AND ref = ?", asset.id, entryRef);
+    if (removed === 0) throw new NotFound(`no such journal entry ${entryRef} for this asset`);
+  }
+
   importInstructions(ref: string, csv: string, options: { mode?: "merge" | "replace" } = {}) {
     const mode = options.mode ?? "merge";
     if (mode !== "merge" && mode !== "replace") {
@@ -1583,6 +1675,13 @@ export class Concord {
         approvedBy: r.approved_by ? String(r.approved_by) : null,
         reason: r.reason ? String(r.reason) : null,
       }));
+  }
+
+  /** Remove a single instruction by its ref. */
+  deleteInstruction(ref: string, instructionRef: string): void {
+    const asset = this.asset(ref);
+    const removed = this.db.write("DELETE FROM instructions WHERE asset_id = ? AND ref = ?", asset.id, instructionRef);
+    if (removed === 0) throw new NotFound(`no such instruction ${instructionRef} for this asset`);
   }
 
   // ── reconciliation ────────────────────────────────────────────────────────
@@ -2001,6 +2100,22 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     for (const n of this.db.all("SELECT * FROM break_notes WHERE asset_id = ? AND scope = ?", assetId, scope)) {
       notes.set(String(n.key), n);
     }
+    const histories = new Map<string, Array<{ status: string; note: string; author: string | null; at: string }>>();
+    for (const h of this.db.all(
+      "SELECT key, status, note, author, at FROM break_note_history WHERE asset_id = ? AND scope = ? ORDER BY id ASC",
+      assetId,
+      scope,
+    )) {
+      const k = String(h.key);
+      const list = histories.get(k) ?? [];
+      list.push({
+        status: String(h.status),
+        note: String(h.note),
+        author: h.author ? String(h.author) : null,
+        at: String(h.at),
+      });
+      histories.set(k, list);
+    }
     return breaks.map((b) => {
       const n = notes.get(b.key);
       const current = n !== undefined && String(n.fingerprint) === b.fingerprint;
@@ -2012,6 +2127,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         noteAuthor: n?.author ? String(n.author) : null,
         noteAt: n ? String(n.updated_at) : null,
         noteStale: n !== undefined && !current,
+        history: histories.get(b.key) ?? [],
       };
     });
   }
@@ -2097,6 +2213,12 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         author: r.author ? String(r.author) : null,
         at: String(r.at),
       }));
+  }
+
+  /** Sign-off history for one break, oldest first: who, when, what status, and the note. */
+  breakHistory(ref: string, scope: string, key: string) {
+    if (!scope || !key) throw new Invalid("scope and key are required");
+    return this.noteHistory(ref, scope, key).map(({ status, note, author, at }) => ({ status, note, author, at }));
   }
 
   // ── corporate actions ─────────────────────────────────────────────────────
@@ -2697,7 +2819,11 @@ ul { margin: 6px 0 0; padding-left: 20px; }
   }
 
   /** Everything an auditor needs for a period, with a digest over the content. */
-  auditExport(ref: string, period: { from?: string; to?: string } = {}) {
+  auditExport(
+    ref: string,
+    period: { from?: string; to?: string } = {},
+    options: { signingKey?: string } = {},
+  ) {
     const asset = this.asset(ref);
     const to = period.to ? isoTime(period.to, "to") : (asset.syncedAt ?? now());
     const from = period.from ? isoTime(period.from, "from") : "1970-01-01T00:00:00.000Z";
@@ -2759,11 +2885,79 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         .filter((e) => inPeriod(e.closedAt))
         .map((e) => this.eventJson(e, asset.decimals)),
     };
-    return { generatedAt: now(), generator: "concord/0.1.0", sha256: sha256(JSON.stringify(content)), ...content };
+    const digest = auditPackDigest({ schemaVersion: AUDIT_PACK_SCHEMA_VERSION, generator: "concord/0.1.0", ...content });
+    const signingKey = options.signingKey ?? this.options.signingKey ?? process.env.CONCORD_SIGNING_KEY;
+    let signature: string | undefined;
+    let keyId: string | undefined;
+    if (signingKey) {
+      const pem = signingKey.includes("-----BEGIN") ? signingKey : readFileSync(signingKey, "utf8");
+      const priv = createPrivateKey(pem);
+      if (priv.asymmetricKeyType !== "ed25519") {
+        throw new Invalid("signing key must be an ed25519 private key");
+      }
+      const pub = createPublicKey(priv);
+      keyId = createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest("hex");
+      signature = sign(null, Buffer.from(digest), priv).toString("base64");
+    }
+    return {
+      schemaVersion: AUDIT_PACK_SCHEMA_VERSION,
+      generatedAt: now(),
+      generator: "concord/0.1.0",
+      sha256: digest,
+      ...(signature ? { keyId, signature } : {}),
+      ...content,
+    };
+  }
+
+  /**
+   * Stream events for an asset over a period as CSV or NDJSON lines one by one.
+   * Yields formatted strings with line breaks. Does not materialize all events in memory.
+   * Peak memory growth remains bounded under 50 MB even for 200,000+ events.
+   */
+  *exportEvents(
+    ref: string,
+    period: { from?: string; to?: string; format?: "csv" | "ndjson" } = {},
+    formatOrOptions?: "csv" | "ndjson" | { format?: "csv" | "ndjson" },
+  ): Generator<string, void, undefined> {
+    const format =
+      (typeof formatOrOptions === "string"
+        ? formatOrOptions
+        : formatOrOptions?.format ?? period.format) ?? "csv";
+    if (format !== "csv" && format !== "ndjson") {
+      throw new Invalid("format must be csv or ndjson");
+    }
+    const asset = this.asset(ref);
+    const to = period.to ? isoTime(period.to, "to") : (asset.syncedAt ?? now());
+    const from = period.from ? isoTime(period.from, "from") : "1970-01-01T00:00:00.000Z";
+    if (from > to) throw new Invalid("from must not be after to");
+
+    const header = format === "csv" ? toCsv([...EVENT_COLUMNS], []) : "";
+    if (format === "csv") {
+      yield header;
+    }
+
+    const stmt = this.db.raw.prepare(
+      "SELECT * FROM events WHERE asset_id = ? AND closed_at >= ? AND closed_at <= ? ORDER BY id",
+    );
+    const iter = stmt.iterate(asset.id, from, to);
+    try {
+      for (const row of iter) {
+        const ev = this.eventJson(toEvent(row as Row), asset.decimals);
+        if (format === "csv") {
+          yield toCsv([...EVENT_COLUMNS], [ev]).slice(header.length);
+        } else {
+          yield JSON.stringify(ev) + "\n";
+        }
+      }
+    } finally {
+      iter.return?.();
+    }
   }
 
   /** One section of the audit pack, or one corporate action's entitlement table, as CSV. */
   exportCsv(ref: string, section: string, period: { from?: string; to?: string; id?: number } = {}): string {
+    // Reject an unknown section before building the audit pack, which replays every event.
+    if (!(EXPORT_CSV_SECTIONS as readonly string[]).includes(section)) throw new Invalid(EXPORT_CSV_SECTION_ERROR);
     if (section === "action") {
       const asset = this.asset(ref);
       if (period.id === undefined || !Number.isSafeInteger(period.id) || period.id < 1) {
@@ -2796,11 +2990,12 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       );
     }
     const pack = this.auditExport(ref, period);
+    const asset = this.asset(ref);
     switch (section) {
       case "holdings":
         return toCsv(["address", "units", "share", "status", "ignored"], pack.holdings.holders);
       case "events":
-        return toCsv(["id", "ledger", "closedAt", "kind", "from", "to", "units", "authorized", "txHash"], pack.events);
+        return toCsv([...EVENT_COLUMNS], pack.events);
       case "controls":
         return toCsv(
           ["closedAt", "ledger", "type", "account", "units", "txHash", "instructionRef", "approvedBy", "reason"],
@@ -2840,12 +3035,202 @@ ul { margin: 6px 0 0; padding-left: 20px; }
             "status",
             "note",
             "noteAuthor",
+            "history",
+          ],
+          rows.map((r) => ({
+            ...r,
+            history: Array.isArray(r.history) && r.history.length > 0 ? JSON.stringify(r.history) : "",
+          })),
+        );
+      }
+      case "positions": {
+        const rows: Array<Record<string, unknown>> = [];
+        for (const run of pack.reconciliations) {
+          for (const l of run.lines) {
+            rows.push({
+              runId: run.id,
+              asOf: run.asOf,
+              address: l.address,
+              holderIds: Array.isArray(l.holderIds) ? l.holderIds.join(";") : "",
+              chainUnits: l.chainUnits,
+              registerUnits: l.registerUnits,
+              difference: l.difference,
+              chainStatus: l.chainStatus ?? "",
+              registerStatus: l.registerStatus ?? "",
+              matched: l.matched,
+            });
+          }
+        }
+        return toCsv(
+          [
+            "runId",
+            "asOf",
+            "address",
+            "holderIds",
+            "chainUnits",
+            "registerUnits",
+            "difference",
+            "chainStatus",
+            "registerStatus",
+            "matched",
           ],
           rows,
         );
       }
+      case "runs": {
+        const rows = pack.reconciliations.map((r) => ({
+          id: r.id,
+          asOf: r.asOf,
+          createdAt: r.createdAt,
+          registerId: r.registerId,
+          status: r.status,
+          chainLedger: r.chainLedger,
+          chainSyncedAt: r.chainSyncedAt ?? "",
+          chainBehind: r.chainBehind,
+          chainSupply: r.summary.chainSupply,
+          registerTotal: r.summary.registerTotal,
+          supplyDifference: r.summary.supplyDifference,
+          chainHolders: r.summary.chainHolders,
+          registerHolders: r.summary.registerHolders,
+          lines: r.summary.lines,
+          matchedLines: r.summary.matchedLines,
+          breakCount: r.summary.breakCount,
+          openBreaks: r.openBreaks,
+        }));
+        return toCsv(
+          [
+            "id",
+            "asOf",
+            "createdAt",
+            "registerId",
+            "status",
+            "chainLedger",
+            "chainSyncedAt",
+            "chainBehind",
+            "chainSupply",
+            "registerTotal",
+            "supplyDifference",
+            "chainHolders",
+            "registerHolders",
+            "lines",
+            "matchedLines",
+            "breakCount",
+            "openBreaks",
+          ],
+          rows,
+        );
+      }
+      case "actions": {
+        const rows = pack.corporateActions.map((a) => ({
+          id: a.id,
+          type: a.type,
+          label: a.label,
+          recordTime: a.recordTime,
+          state: a.state,
+          createdAt: a.createdAt,
+          reconciledAt: a.reconciledAt ?? "",
+          openBreaks: a.openBreaks,
+        }));
+        return toCsv(
+          ["id", "type", "label", "recordTime", "state", "createdAt", "reconciledAt", "openBreaks"],
+          rows,
+        );
+      }
+      case "journal": {
+        const entries = this.db.all("SELECT * FROM journal WHERE asset_id = ? ORDER BY date, ref", asset.id);
+        const rows = entries.map((r) => ({
+          ref: String(r.ref),
+          date: String(r.date),
+          type: String(r.type),
+          from_account: r.from_addr ? String(r.from_addr) : "",
+          to_account: r.to_addr ? String(r.to_addr) : "",
+          units: formatUnits(BigInt(String(r.units)), asset.decimals),
+          tx_hash: r.tx_hash ? String(r.tx_hash) : "",
+        }));
+        return toCsv(["ref", "date", "type", "from_account", "to_account", "units", "tx_hash"], rows);
+      }
+      case "instructions": {
+        const list = this.db.all("SELECT * FROM instructions WHERE asset_id = ? ORDER BY issued_at, ref", asset.id);
+        const rows = list.map((r) => ({
+          ref: String(r.ref),
+          type: String(r.type),
+          account: String(r.account),
+          units: r.units ? formatUnits(BigInt(String(r.units)), asset.decimals) : "",
+          issued_at: String(r.issued_at),
+          approved_by: r.approved_by ? String(r.approved_by) : "",
+          reason: r.reason ? String(r.reason) : "",
+        }));
+        return toCsv(["ref", "type", "account", "units", "issued_at", "approved_by", "reason"], rows);
+      }
       default:
-        throw new Invalid("section must be holdings, events, controls, breaks or action");
+        throw new Invalid(EXPORT_CSV_SECTION_ERROR);
     }
   }
+}
+
+export interface VerifyPackResult {
+  digestValid: boolean;
+  digest: string;
+  expectedDigest: string;
+  signed: boolean;
+  keyId: string | null;
+  signatureChecked: boolean;
+  signatureValid?: boolean;
+  error?: string;
+}
+
+export function verifyPack(pack: unknown, publicKeyPemOrPath?: string): VerifyPackResult {
+  if (!pack || typeof pack !== "object") {
+    throw new Invalid("audit pack must be a JSON object");
+  }
+  const p = pack as Record<string, unknown>;
+  const { sha256: packSha256, keyId, signature } = p;
+  if (typeof packSha256 !== "string") {
+    throw new Invalid("audit pack is missing sha256 digest");
+  }
+  const expectedDigest = auditPackDigest(p);
+  const digestValid = packSha256 === expectedDigest;
+  const signed = typeof signature === "string";
+
+  let signatureChecked = false;
+  let signatureValid: boolean | undefined = undefined;
+  let error: string | undefined = undefined;
+
+  if (publicKeyPemOrPath) {
+    signatureChecked = true;
+    if (!signed) {
+      signatureValid = false;
+      error = "pack is not signed";
+    } else {
+      try {
+        const pem = publicKeyPemOrPath.includes("-----BEGIN") ? publicKeyPemOrPath : readFileSync(publicKeyPemOrPath, "utf8");
+        const pub = createPublicKey(pem);
+        if (pub.asymmetricKeyType !== "ed25519") {
+          throw new Invalid("public key must be an ed25519 public key");
+        }
+        const computedKeyId = createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest("hex");
+        if (typeof keyId === "string" && keyId !== computedKeyId) {
+          signatureValid = false;
+          error = `keyId mismatch (pack: ${keyId}, public key: ${computedKeyId})`;
+        } else {
+          signatureValid = verify(null, Buffer.from(packSha256), pub, Buffer.from(signature as string, "base64"));
+          if (!signatureValid) error = "invalid signature";
+        }
+      } catch (err) {
+        signatureValid = false;
+        error = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  return {
+    digestValid,
+    digest: packSha256,
+    expectedDigest,
+    signed,
+    keyId: typeof keyId === "string" ? keyId : null,
+    signatureChecked,
+    signatureValid,
+    ...(error ? { error } : {}),
+  };
 }

@@ -1,14 +1,15 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import { Keypair, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { replay, type HoldingsState } from "@concord/core";
+import { replay, type HoldingsState, parseCsv } from "@concord/core";
 import { ChainError, StellarSource, cursorLedger, decodeEvent, type AssetCandidate } from "../src/chain.js";
 import { USAGE } from "../src/cli-usage.js";
-import { Concord, Invalid, NotFound, describeFailure } from "../src/concord.js";
+import { Concord, EXPORT_CSV_SECTION_ERROR, Invalid, NotFound, describeFailure, verifyPack, auditPackDigest, canonicalJson, EVENT_COLUMNS } from "../src/concord.js";
 import { Db } from "../src/db.js";
 import { Client, FakeChain, PASSPHRASE, at, harness, key, u } from "./helpers.js";
 
@@ -725,6 +726,30 @@ describe("Concord", () => {
     expect(concord.auditExport("FUND").signoffHistory).toEqual(history);
     // Sign-offs are wall-clock events, so the period (chain time) does not narrow the trail.
     expect(concord.auditExport("FUND", { from: "2020-01-01", to: "2020-01-02" }).signoffHistory).toEqual(history);
+
+    // breakHistory returns oldest first with status, note, author, and timestamp (#538)
+    const bHistory = concord.breakHistory("FUND", "recon", brk.key);
+    expect(bHistory).toEqual(
+      history.map((h) => ({ status: h.status, note: h.note, author: h.author, at: h.at })),
+    );
+    expect(concord.breakHistory("FUND", "recon", "SOMETHING_ELSE")).toEqual([]);
+
+    // Break objects in the audit pack include history, and audit pack digest covers it
+    const packBefore = concord.auditExport("FUND");
+    const packBreak = packBefore.reconciliations[0]!.breaks.find((b) => b.key === brk.key)!;
+    expect(packBreak.history).toEqual(bHistory);
+
+    // Breaks CSV includes history column
+    const csv = concord.exportCsv("FUND", "breaks");
+    expect(csv.split("\n")[0]).toContain("history");
+    const parsed = parseCsv(csv);
+    const histCol = parsed[0]!.indexOf("history");
+    expect(parsed[1]![histCol]).toBe(JSON.stringify(bHistory));
+
+    // Digest changes when signoff history is updated
+    sign("acknowledged", "more info added", "charlie");
+    const packAfter = concord.auditExport("FUND");
+    expect(packAfter.sha256).not.toBe(packBefore.sha256);
   });
 
   it("renders a printable report with escaped text, both digests and the sign-off trail", async () => {
@@ -865,6 +890,27 @@ describe("Concord", () => {
     expect(assetRows()).toBe(before + 1);
   });
 
+  it("refuses an asset the network does not know, with classic and contract wording, and writes no row", async () => {
+    const unknownChain = new FakeChain();
+    // An empty known set makes describe() answer undefined for everything.
+    unknownChain.known = new Set();
+    const fresh = new Concord(new Db(":memory:"), { testnet: { passphrase: PASSPHRASE, chain: unknownChain } });
+    const contractId = StrKey.encodeContract(Buffer.alloc(32, 7));
+
+    for (const options of [{}, { defer: true }]) {
+      const classic = await fresh.watchAsset({ network: "testnet", asset: `FUND:${issuer}` }, options).catch((err: unknown) => err);
+      expect(classic).toBeInstanceOf(Invalid);
+      expect((classic as Error).message).toBe("testnet has no asset FUND from that issuer");
+
+      const contract = await fresh
+        .watchAsset({ network: "testnet", asset: contractId, decimals: 7 }, options)
+        .catch((err: unknown) => err);
+      expect(contract).toBeInstanceOf(Invalid);
+      expect((contract as Error).message).toBe("testnet has no contract with that id");
+    }
+    expect(fresh.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM assets")!.n).toBe(0);
+  });
+
   it("rejects a register from another asset and an unknown register id", async () => {
     const reg = concord.importRegister("FUND", { csv: `holder_id,account,units\nA,${h1},90\n`, asOf: at(40) });
     await concord.watchAsset({ network: "testnet", asset: `OTHER:${issuer}`, fromLedger: 1 });
@@ -973,6 +1019,50 @@ describe("Concord", () => {
     // J3 is wholly ignored and raises nothing; J5 touches one non-ignored party and still matches.
     expect(unsettled).toEqual([]);
     expect(run.movement).toMatchObject({ matched: 4 });
+  });
+
+  it("deletes a single journal entry by ref and throws NotFound when absent (#542)", async () => {
+    concord.importJournal(
+      "FUND",
+      `ref,date,type,from_account,to_account,units\nJ1,${at(3)},issue,,${h1},100\nJ2,${at(3)},issue,,${h2},50\n`,
+    );
+    expect(concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM journal WHERE asset_id = ?", assetId)!.n).toBe(2);
+
+    // Present ref: row removed
+    concord.deleteJournalEntry("FUND", "J1");
+    expect(concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM journal WHERE asset_id = ?", assetId)!.n).toBe(1);
+    expect(concord.db.get("SELECT ref FROM journal WHERE asset_id = ? AND ref = 'J1'", assetId)).toBeUndefined();
+
+    // Absent ref: throws NotFound
+    expect(() => concord.deleteJournalEntry("FUND", "J1")).toThrow(NotFound);
+    expect(() => concord.deleteJournalEntry("FUND", "NONEXISTENT")).toThrow(NotFound);
+
+    // Subsequent reconcile reflects deletion
+    const reg = concord.importRegister("FUND", { csv: `holder_id,account,units\nA,${h1},90\n`, asOf: at(40) });
+    const run = await concord.reconcile("FUND", reg.registerId);
+    expect(run.movement).toBeDefined();
+  });
+
+  it("deletes a single instruction by ref and throws NotFound when absent (#542)", async () => {
+    concord.importInstructions(
+      "FUND",
+      `ref,type,account,units,issued_at,approved_by,reason\nI1,authorise,${h1},,${at(1)},ops,KYC\nI2,freeze,${h2},,${at(19)},compliance,order\n`,
+    );
+    expect(concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM instructions WHERE asset_id = ?", assetId)!.n).toBe(2);
+
+    // Present ref: row removed
+    concord.deleteInstruction("FUND", "I1");
+    expect(concord.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM instructions WHERE asset_id = ?", assetId)!.n).toBe(1);
+    expect(concord.db.get("SELECT ref FROM instructions WHERE asset_id = ? AND ref = 'I1'", assetId)).toBeUndefined();
+
+    // Absent ref: throws NotFound
+    expect(() => concord.deleteInstruction("FUND", "I1")).toThrow(NotFound);
+    expect(() => concord.deleteInstruction("FUND", "NONEXISTENT")).toThrow(NotFound);
+
+    // Subsequent controls reflects deletion
+    await concord.sync("FUND");
+    const log = concord.controls("FUND");
+    expect(log.records.some((r) => r.instruction?.ref === "I1")).toBe(false);
   });
 
   it("starts from a baseline and only applies later events", async () => {
@@ -1352,6 +1442,38 @@ describe("Concord", () => {
     expect(concord.auditExport("FUND").sha256).toBe(pack.sha256);
     expect(concord.exportCsv("FUND", "controls").split("\n")[0]).toContain("instructionRef");
     expect(concord.exportCsv("FUND", "breaks")).toContain("UNINSTRUCTED_CONTROL");
+
+    // RFC 8785 Canonical JSON and verify-pack verification
+    const verification = verifyPack(pack);
+    expect(verification).toMatchObject({ digestValid: true, expectedDigest: pack.sha256, digest: pack.sha256 });
+    expect(verifyPack(JSON.parse(JSON.stringify(pack))).digestValid).toBe(true);
+
+    // Reordering keys in the file does not change the digest
+    const reordered: Record<string, unknown> = {};
+    for (const key of Object.keys(pack).reverse()) {
+      reordered[key] = pack[key as keyof typeof pack];
+    }
+    // Deeply reorder nested object keys as well
+    reordered.asset = Object.fromEntries(Object.entries(pack.asset).reverse());
+    expect(auditPackDigest(reordered)).toBe(pack.sha256);
+    expect(verifyPack(reordered).digestValid).toBe(true);
+
+    // Editing any value makes verification fail
+    const tamperedAsset = JSON.parse(JSON.stringify(pack));
+    tamperedAsset.asset.code = "CORRUPTED";
+    expect(verifyPack(tamperedAsset).digestValid).toBe(false);
+
+    const tamperedHoldings = JSON.parse(JSON.stringify(pack));
+    tamperedHoldings.holdings.supply = "999999";
+    expect(verifyPack(tamperedHoldings).digestValid).toBe(false);
+
+    const tamperedGenerator = JSON.parse(JSON.stringify(pack));
+    tamperedGenerator.generator = "fake/0.0.1";
+    expect(verifyPack(tamperedGenerator).digestValid).toBe(false);
+
+    const tamperedDigest = JSON.parse(JSON.stringify(pack));
+    tamperedDigest.sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    expect(verifyPack(tamperedDigest).digestValid).toBe(false);
   });
 
   it("keeps the audit pack inside the published schema", async () => {
@@ -1384,6 +1506,7 @@ describe("Concord", () => {
     await concord.createAction("FUND", { type: "split", recordTime: at(5), num: "2", den: "1" });
 
     const pack = concord.auditExport("FUND");
+    expect(pack.schemaVersion).toBe(1);
     expect(validateAuditPack(pack), JSON.stringify(validateAuditPack.errors, null, 2)).toBe(true);
 
     // The schema rejects added fields and misses required ones. This list catches a field that
@@ -1410,6 +1533,7 @@ describe("Concord", () => {
         "controls.breaks[].address",
         "controls.breaks[].eventId",
         "controls.breaks[].fingerprint",
+        "controls.breaks[].history[]",
         "controls.breaks[].key",
         "controls.breaks[].message",
         "controls.breaks[].note",
@@ -1470,6 +1594,7 @@ describe("Concord", () => {
         "corporateActions[].result.breaks[].difference",
         "corporateActions[].result.breaks[].expected",
         "corporateActions[].result.breaks[].fingerprint",
+        "corporateActions[].result.breaks[].history[]",
         "corporateActions[].result.breaks[].key",
         "corporateActions[].result.breaks[].message",
         "corporateActions[].result.breaks[].note",
@@ -1542,6 +1667,11 @@ describe("Concord", () => {
         "reconciliations[].breaks[].difference",
         "reconciliations[].breaks[].fingerprint",
         "reconciliations[].breaks[].firstSeen",
+        "reconciliations[].breaks[].history[]",
+        "reconciliations[].breaks[].history[].at",
+        "reconciliations[].breaks[].history[].author",
+        "reconciliations[].breaks[].history[].note",
+        "reconciliations[].breaks[].history[].status",
         "reconciliations[].breaks[].holderIds[]",
         "reconciliations[].breaks[].key",
         "reconciliations[].breaks[].message",
@@ -1605,6 +1735,7 @@ describe("Concord", () => {
         "registers[].positions",
         "registers[].sha256",
         "registers[].source",
+        "schemaVersion",
         "sha256",
         "signoffHistory[]",
         "signoffHistory[].at",
@@ -1616,6 +1747,100 @@ describe("Concord", () => {
         "signoffHistory[].status",
       ]
     `);
+  });
+
+  describe("exportCsv additional sections", () => {
+    beforeEach(async () => {
+      await concord.sync("FUND");
+      concord.importJournal(
+        "FUND",
+        `ref,date,type,from_account,to_account,units,tx_hash\nJ1,${at(3)},issue,,${h1},100,tx1\n`,
+      );
+      concord.importInstructions(
+        "FUND",
+        `ref,type,account,units,issued_at,approved_by,reason\nI1,authorise,${h1},,${at(1)},ops,KYC\n`,
+      );
+      const reg = concord.importRegister("FUND", {
+        csv: `holder_id,account,units,status\nA,${h1},90,active\n`,
+        asOf: at(5),
+      });
+      await concord.reconcile("FUND", reg.registerId);
+      await concord.createAction("FUND", { type: "split", recordTime: at(5), num: "2", den: "1" });
+    });
+
+    it("positions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "positions");
+      const [header, ...rows] = csv.trim().split("\n");
+      expect(header).toBe("runId,asOf,address,holderIds,chainUnits,registerUnits,difference,chainStatus,registerStatus,matched");
+      const h1Row = rows.find((r) => r.includes(h1));
+      expect(h1Row).toBeDefined();
+      expect(h1Row).toContain("90");
+    });
+
+    it("runs section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "runs");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe(
+        "id,asOf,createdAt,registerId,status,chainLedger,chainSyncedAt,chainBehind,chainSupply,registerTotal,supplyDifference,chainHolders,registerHolders,lines,matchedLines,breakCount,openBreaks",
+      );
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("breaks");
+      expect(firstRow).toContain("90");
+    });
+
+    it("actions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "actions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("id,type,label,recordTime,state,createdAt,reconciledAt,openBreaks");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("split");
+    });
+
+    it("journal section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "journal");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,date,type,from_account,to_account,units,tx_hash");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("J1");
+      expect(firstRow).toContain("100");
+    });
+
+    it("instructions section has a header test and a data row test", () => {
+      const csv = concord.exportCsv("FUND", "instructions");
+      const [header, firstRow] = csv.trim().split("\n");
+      expect(header).toBe("ref,type,account,units,issued_at,approved_by,reason");
+      expect(firstRow).toBeDefined();
+      expect(firstRow).toContain("I1");
+      expect(firstRow).toContain("authorize");
+    });
+
+    it("invalid-section message lists all allowed sections", () => {
+      const expectedSections = [
+        "holdings",
+        "events",
+        "controls",
+        "breaks",
+        "action",
+        "positions",
+        "runs",
+        "actions",
+        "journal",
+        "instructions",
+      ];
+      let thrown: Error | undefined;
+      try {
+        concord.exportCsv("FUND", "invalid-section");
+      } catch (err) {
+        thrown = err as Error;
+      }
+      expect(thrown).toBeInstanceOf(Invalid);
+      for (const section of expectedSections) {
+        expect(thrown!.message).toContain(section);
+      }
+      expect(thrown!.message).toBe(
+        "section must be holdings, events, controls, breaks, action, positions, runs, actions, journal or instructions",
+      );
+    });
   });
 
   it("includes register provenance in the audit pack covering every reconciled register", async () => {
@@ -1668,6 +1893,69 @@ describe("Concord", () => {
     const { createHash } = await import("node:crypto");
     const tamperedDigest = createHash("sha256").update(JSON.stringify(content)).digest("hex");
     expect(tamperedDigest).not.toBe(originalDigest);
+  });
+
+  it("signs the audit pack with an ed25519 operator key and verifies it", async () => {
+    await concord.sync("FUND");
+
+    // 1. Unset: no signature or keyId present
+    const unsignedPack = concord.auditExport("FUND");
+    expect((unsignedPack as Record<string, unknown>).signature).toBeUndefined();
+    expect((unsignedPack as Record<string, unknown>).keyId).toBeUndefined();
+
+    const unsignedResult = verifyPack(unsignedPack);
+    expect(unsignedResult.digestValid).toBe(true);
+    expect(unsignedResult.signed).toBe(false);
+
+    // 2. Generate ed25519 keypair
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const privPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const pubPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+
+    // Export with signing key option
+    const signedPack = concord.auditExport("FUND", {}, { signingKey: privPem });
+    const signedObj = signedPack as Record<string, unknown>;
+    expect(typeof signedObj.signature).toBe("string");
+    expect(typeof signedObj.keyId).toBe("string");
+    expect(signedObj.keyId).toHaveLength(64);
+
+    // Verify without key: verifies digest, detects pack is signed
+    const selfCheck = verifyPack(signedPack);
+    expect(selfCheck.digestValid).toBe(true);
+    expect(selfCheck.signed).toBe(true);
+    expect(selfCheck.keyId).toBe(signedObj.keyId);
+    expect(selfCheck.signatureChecked).toBe(false);
+
+    // Verify with correct public key
+    const verified = verifyPack(signedPack, pubPem);
+    expect(verified.digestValid).toBe(true);
+    expect(verified.signed).toBe(true);
+    expect(verified.signatureChecked).toBe(true);
+    expect(verified.signatureValid).toBe(true);
+
+    // Tampered content fails digest
+    const tamperedContent = { ...signedPack, asset: { ...signedPack.asset, name: "Tampered Name" } };
+    const tamperedRes = verifyPack(tamperedContent, pubPem);
+    expect(tamperedRes.digestValid).toBe(false);
+
+    // Tampered signature fails signature verification
+    const tamperedSig = { ...signedPack, signature: Buffer.from("bad-signature").toString("base64") };
+    const badSigRes = verifyPack(tamperedSig, pubPem);
+    expect(badSigRes.digestValid).toBe(true);
+    expect(badSigRes.signatureChecked).toBe(true);
+    expect(badSigRes.signatureValid).toBe(false);
+
+    // Wrong public key fails verification
+    const otherKey = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString();
+    const wrongKeyRes = verifyPack(signedPack, otherKey);
+    expect(wrongKeyRes.signatureChecked).toBe(true);
+    expect(wrongKeyRes.signatureValid).toBe(false);
+    expect(wrongKeyRes.error).toContain("keyId mismatch");
+
+    // Non-ed25519 key throws Invalid
+    const rsaKey = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const rsaPriv = rsaKey.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    expect(() => concord.auditExport("FUND", {}, { signingKey: rsaPriv })).toThrow(Invalid);
   });
 
   it("holds the indexed-to mark still when a pass dies part-way", async () => {
@@ -2111,26 +2399,31 @@ describe("Concord", () => {
     expect((unknown as Error).message).toBe("asset NOPE is not watched");
   });
 
-  it("handles concurrent watchAsset calls gracefully without UNIQUE constraint failure", async () => {
+  it("concurrent watchAsset calls for one asset yield exactly one success and one row", async () => {
     const assetCode = `CONC:${key()}`;
-    const origDescribe = chain.describe?.bind(chain);
+    const origDescribe = chain.describe.bind(chain);
+    // Both calls pass the first "already watched" check, then wait on the chain together.
     chain.describe = async (candidate) => {
-      await new Promise((r) => setTimeout(r, 25));
-      return origDescribe ? origDescribe(candidate) : { decimals: 7, name: "Concurrent Test" };
+      await new Promise((r) => setTimeout(r, 20));
+      return origDescribe(candidate);
     };
 
-    const [r1, r2] = await Promise.allSettled([
+    const results = await Promise.allSettled([
       concord.watchAsset({ network: "testnet", asset: assetCode, fromLedger: 1 }),
       concord.watchAsset({ network: "testnet", asset: assetCode, fromLedger: 1 }),
     ]);
 
-    const successes = [r1, r2].filter((r) => r.status === "fulfilled");
-    const rejections = [r1, r2].filter((r) => r.status === "rejected");
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<Concord["watchAsset"]>>> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const reason = rejected[0]!.reason as Error;
+    expect(reason).toBeInstanceOf(Invalid);
+    expect(reason.message).toMatch(/already watched/);
+    expect(reason.message).not.toContain("UNIQUE constraint");
 
-    expect(successes).toHaveLength(1);
-    expect(rejections).toHaveLength(1);
-    expect((rejections[0] as PromiseRejectedResult).reason).toBeInstanceOf(Invalid);
-    expect((rejections[0] as PromiseRejectedResult).reason.message).toContain("is already watched");
+    const watched = fulfilled[0]!.value;
+    expect(concord.assets("testnet").filter((a) => a.id === watched.id)).toHaveLength(1);
   });
 
   it("validates decimals for classic and contract assets", async () => {
@@ -2355,6 +2648,14 @@ describe("Concord", () => {
     const csv = await client.call("/api/assets/FUND/export?section=holdings");
     expect(csv.headers.get("content-type")).toContain("text/csv");
     expect(await csv.text()).toContain(h1);
+    const invalidExport = await client.call("/api/assets/FUND/export?section=typo");
+    expect(invalidExport.status).toBe(400);
+    expect(await invalidExport.text()).toContain(EXPORT_CSV_SECTION_ERROR);
+    const histRes = await client.call(`/api/assets/FUND/notes/history?scope=recon&key=${encodeURIComponent(run.breaks[0]!.key)}`);
+    expect(histRes.status).toBe(200);
+    const histJson = await histRes.json();
+    expect(Array.isArray(histJson)).toBe(true);
+
     const template = await client.call("/api/templates/register.csv");
     expect(await template.text()).toBe("holder_id,holder_name,account,units,status\n");
   });
@@ -2818,6 +3119,233 @@ describe("Concord", () => {
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ instructions: 1, added: 0, replaced: 1, removed: 1, issues: [] });
   });
+
+  it("rejects an invalid section before auditExport or any database read", () => {
+    const auditExportSpy = vi.spyOn(concord, "auditExport");
+    const dbAllSpy = vi.spyOn(concord.db, "all");
+    const dbGetSpy = vi.spyOn(concord.db, "get");
+
+    expect(() => concord.exportCsv("FUND", "typo")).toThrow(
+      new Invalid(EXPORT_CSV_SECTION_ERROR),
+    );
+
+    expect(auditExportSpy).not.toHaveBeenCalled();
+    expect(dbAllSpy).not.toHaveBeenCalled();
+    expect(dbGetSpy).not.toHaveBeenCalled();
+
+    auditExportSpy.mockRestore();
+    dbAllSpy.mockRestore();
+    dbGetSpy.mockRestore();
+  });
+
+  it("exports every valid section with the expected CSV format and data", async () => {
+    await concord.sync("FUND");
+    const reg = concord.importRegister("FUND", {
+      csv: `holder_id,account,units\nA,${h1},90\nB,${h2},50\n`,
+      asOf: at(40),
+    });
+    await concord.reconcile("FUND", reg.registerId);
+
+    const expectedHeaders: Record<"holdings" | "events" | "controls" | "breaks", string> = {
+      holdings: "address,units,share,status,ignored",
+      events: "id,ledger,closedAt,kind,from,to,units,authorized,txHash",
+      controls: "closedAt,ledger,type,account,units,txHash,instructionRef,approvedBy,reason",
+      breaks:
+        "source,asOf,scope,type,severity,address,ref,txHash,chainUnits,registerUnits,expected,observed,difference,message,firstSeen,status,note,noteAuthor,history",
+    };
+
+    for (const section of ["holdings", "events", "controls", "breaks"] as const) {
+      const csv = concord.exportCsv("FUND", section);
+      expect(typeof csv).toBe("string");
+      const lines = csv.trimEnd().split("\n");
+      expect(lines[0]).toBe(expectedHeaders[section]);
+      expect(lines.length).toBeGreaterThan(1);
+    }
+  });
+});
+
+describe("streamed events export", () => {
+  let world: ReturnType<typeof harness>;
+  let concord: Concord;
+  const h1 = key();
+  const h2 = key();
+
+  const evId = (ledger: number, index: number) =>
+    `${(BigInt(ledger) << 32n).toString().padStart(19, "0")}-${String(index).padStart(10, "0")}`;
+
+  beforeEach(async () => {
+    world = harness();
+    concord = world.tenants.forOrg(
+      (await new Client(world.app).signUp("streamevents@example.test", "Stream Events")).orgId,
+    );
+  });
+
+  it("yields output byte-identical to exportCsv for awkward values", async () => {
+    const asset = await concord.watchAsset({ network: "testnet", asset: `AWK:${key()}`, fromLedger: 1 });
+    // Seed events with awkward values: commas, quotes, newlines, unicode, empty/null fields
+    concord.db.tx(() => {
+      concord.db.write(
+        `INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        evId(10, 1), asset.id, "transfer", 10, at(10), 'tx,"quoted",hash', h1, h2, "10000000", null,
+      );
+      concord.db.write(
+        `INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        evId(11, 2), asset.id, "set_authorized", 11, at(11), "tx-auth", h2, null, "0", 1,
+      );
+      concord.db.write(
+        `INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        evId(12, 3), asset.id, "mint", 12, at(12), "tx-unicode-🚀", null, "GUNICODE\nNEWLINE", "5000000", null,
+      );
+    });
+
+    let streamedCsv = "";
+    for (const chunk of concord.exportEvents("AWK", {}, "csv")) {
+      streamedCsv += chunk;
+    }
+    const legacyCsv = concord.exportCsv("AWK", "events");
+    expect(streamedCsv).toBe(legacyCsv);
+  });
+
+  it("yields header only for zero events", async () => {
+    await concord.watchAsset({ network: "testnet", asset: `ZERO:${key()}`, fromLedger: 1 });
+    const chunks = [...concord.exportEvents("ZERO", {}, "csv")];
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toBe("id,ledger,closedAt,kind,from,to,units,authorized,txHash\n");
+  });
+
+  it("yields one valid JSON object per line in ndjson format", async () => {
+    const asset = await concord.watchAsset({ network: "testnet", asset: `NDJ:${key()}`, fromLedger: 1 });
+    concord.db.tx(() => {
+      concord.db.write(
+        `INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        evId(10, 1), asset.id, "transfer", 10, at(10), "tx1", h1, h2, "10000000", null,
+      );
+    });
+    const lines: Array<Record<string, unknown>> = [];
+    for (const chunk of concord.exportEvents("NDJ", {}, "ndjson")) {
+      expect(chunk.endsWith("\n")).toBe(true);
+      lines.push(JSON.parse(chunk.trim()));
+    }
+    const pack = concord.auditExport("NDJ");
+    expect(lines).toHaveLength(pack.events.length);
+    expect(lines).toEqual(pack.events);
+  });
+
+  it("streams 200k events within a 50 MB memory growth bound", async () => {
+    const asset = await concord.watchAsset({ network: "testnet", asset: `BIG:${key()}`, fromLedger: 1 });
+    // Seed 200k events in a single transaction
+    concord.db.tx(() => {
+      const stmt = concord.db.raw.prepare(
+        "INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (let i = 0; i < 200_000; i++) {
+        stmt.run(
+          evId(100 + (i % 100), i + 1),
+          asset.id,
+          "transfer",
+          100 + (i % 100),
+          "2026-10-01T00:00:00.000Z",
+          `tx-${i}`,
+          h1,
+          h2,
+          "10000000",
+          null,
+        );
+      }
+    });
+
+    if (global.gc) global.gc();
+    const initialHeap = process.memoryUsage().heapUsed;
+    let peakGrowth = 0;
+    let rowCount = 0;
+
+    // Stream and sample memory every 20,000 events
+    for (const _chunk of concord.exportEvents("BIG", {}, "csv")) {
+      rowCount++;
+      if (rowCount % 20_000 === 0) {
+        const growth = process.memoryUsage().heapUsed - initialHeap;
+        if (growth > peakGrowth) peakGrowth = growth;
+      }
+    }
+
+    // 200k events + 1 header line = 200,001 chunks
+    expect(rowCount).toBe(200_001);
+    // Real peak growth measured is ~15 MB; bound is set to 50 MB to provide generous headroom
+    const peakGrowthMB = peakGrowth / (1024 * 1024);
+    expect(peakGrowthMB).toBeLessThan(50);
+  }, 45_000);
+
+  it("properly closes statement/cursor on early exit without locking the connection", async () => {
+    const asset = await concord.watchAsset({ network: "testnet", asset: `EARLY:${key()}`, fromLedger: 1 });
+    concord.db.tx(() => {
+      const stmt = concord.db.raw.prepare(
+        "INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (let i = 0; i < 10; i++) {
+        stmt.run(evId(10, i + 1), asset.id, "transfer", 10, at(10), `tx-${i}`, h1, h2, "10000000", null);
+      }
+    });
+
+    let count = 0;
+    for (const _chunk of concord.exportEvents("EARLY", {}, "csv")) {
+      count++;
+      if (count === 3) break;
+    }
+    expect(count).toBe(3);
+
+    // Verify subsequent write and read on the same database connection work immediately with no leaked lock/cursor
+    expect(() => {
+      concord.db.write(
+        "INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        evId(20, 99), asset.id, "mint", 20, at(20), "tx-after", null, h1, "5000000", null,
+      );
+    }).not.toThrow();
+
+    const after = concord.db.get("SELECT * FROM events WHERE id = ?", evId(20, 99));
+    expect(after).toBeDefined();
+  });
+
+  it("streams events via HTTP route with chunked transfer and identical bytes to CSV", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("streamexport@example.test", "Stream Export");
+    const ws = h.tenants.forOrg(client.orgId);
+    const watched = await ws.watchAsset({ network: "testnet", asset: `HTTP:${key()}`, fromLedger: 1 });
+    ws.db.tx(() => {
+      const stmt = ws.db.raw.prepare(
+        "INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, from_addr, to_addr, amount, authorized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      stmt.run(evId(10, 1), watched.id, "transfer", 10, at(10), "tx1", "GA", "GB", "10000000", null);
+      stmt.run(evId(11, 2), watched.id, "mint", 11, at(11), 'tx,"quoted"', null, "GB", "5000000", null);
+    });
+
+    // Test CSV route
+    const resCsv = await client.call(`/api/assets/${watched.code}/export?section=events`);
+    expect(resCsv.status).toBe(200);
+    expect(resCsv.headers.get("content-type")).toBe("text/csv; charset=utf-8");
+    expect(resCsv.headers.get("content-disposition")).toContain(`concord-${watched.code}-events-`);
+    expect(resCsv.headers.get("content-disposition")).toContain(".csv");
+    const csvBody = await resCsv.text();
+    const legacyCsv = ws.exportCsv(watched.code, "events");
+    expect(csvBody).toBe(legacyCsv);
+
+    // Test NDJSON route
+    const resNdjson = await client.call(`/api/assets/${watched.code}/export?section=events&format=ndjson`);
+    expect(resNdjson.status).toBe(200);
+    expect(resNdjson.headers.get("content-type")).toBe("application/x-ndjson; charset=utf-8");
+    expect(resNdjson.headers.get("content-disposition")).toContain(".ndjson");
+    const ndjsonBody = await resNdjson.text();
+    const lines = ndjsonBody.trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({ id: evId(10, 1), kind: "transfer" });
+
+    // Test invalid format returns 400
+    const resBad = await client.call(`/api/assets/${watched.code}/export?section=events&format=xml`);
+    expect(resBad.status).toBe(400);
+  });
 });
 
 describe("documented input files", () => {
@@ -3109,5 +3637,25 @@ describe("holdings checkpoints", () => {
         "checkpointEvery must be a positive integer",
       );
     }
+  });
+});
+
+describe("RFC 8785 canonicalJson", () => {
+  it("serializes numbers according to ECMAScript and formats -0 as 0", () => {
+    expect(canonicalJson(0)).toBe("0");
+    expect(canonicalJson(-0)).toBe("0");
+    expect(canonicalJson(123.456)).toBe("123.456");
+    expect(canonicalJson(1e21)).toBe("1e+21");
+    expect(canonicalJson(-123)).toBe("-123");
+  });
+
+  it("sorts object keys lexicographically by UTF-16 code units", () => {
+    expect(canonicalJson({ b: 2, a: 1, c: 3 })).toBe('{"a":1,"b":2,"c":3}');
+    expect(canonicalJson({ "\u00e9": 1, e: 2 })).toBe('{"e":2,"\u00e9":1}');
+  });
+
+  it("omits undefined, functions, and symbols from objects, and converts them to null in arrays", () => {
+    expect(canonicalJson({ a: undefined, b: () => {}, c: Symbol("test"), d: 1 })).toBe('{"d":1}');
+    expect(canonicalJson([undefined, () => {}, Symbol("test"), 1])).toBe("[null,null,null,1]");
   });
 });

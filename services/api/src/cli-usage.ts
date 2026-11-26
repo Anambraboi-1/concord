@@ -32,7 +32,15 @@ export const CLI_OPTIONS = {
   role: { type: "string" },
   limit: { type: "string" },
   before: { type: "string" },
+  scope: { type: "string" },
+  verify: { type: "boolean" },
+  into: { type: "string" },
+  force: { type: "boolean", short: "f" },
+  status: { type: "string" },
+  key: { type: "string" },
+  run: { type: "string" },
   json: { type: "boolean" },
+  "fail-on-breaks": { type: "boolean" },
   yes: { type: "boolean", short: "y" },
   help: { type: "boolean", short: "h" },
 } as const satisfies ParseArgsOptionsConfig;
@@ -122,6 +130,7 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   sync [ASSET]                     pull new events (every workspace when no --org)
   holdings ASSET [--as-of ISO]     on-chain holders
   register ASSET FILE --as-of ISO  import a register export and reconcile it
+        [--fail-on-breaks]
   registers ASSET                  list imported registers
   register-delete ASSET ID [--yes] remove a register and its reconciliation runs
   journal ASSET FILE               import the register's transaction journal
@@ -129,6 +138,7 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   instructions ASSET FILE          import control instructions
   instructions-list ASSET          list imported control instructions
   reconcile ASSET [--register ID]  re-run a reconciliation
+        [--fail-on-breaks]
   runs ASSET [--limit N]           list reconciliation runs for an asset
   run ID                           show one reconciliation run
   action ASSET dividend --record ISO --rate R [--pay-asset A] [--payer G...] [--until ISO]
@@ -137,6 +147,10 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   actions ASSET                    corporate actions and their state
   controls ASSET                   freeze, authorisation and clawback log
   export ASSET [--from ISO] [--to ISO] [--csv SECTION] [--out FILE]
+  break-history ASSET SCOPE KEY     sign-off history of one break, oldest first
+  signoff ASSET --scope recon|controls|action:N --key KEY --status open|acknowledged|resolved
+        [--note TEXT] [--run N]
+  verify-pack FILE [--key PEM]     check an audit pack's digest, and its signature with --key
 
 Operator commands.
 
@@ -146,8 +160,13 @@ Operator commands.
   reset-link EMAIL                 a one-day link for setting a new password
   invite ORG EMAIL [--role owner|member]  create a workspace invitation link
   org-delete ORG                   delete a workspace and everything in it
-  backup DIR                       copy every database to DIR while the server runs
+  backup DIR [--verify]            copy every database to DIR while the server runs; --verify
+                                   checks each copy's integrity and schema version
+  restore DIR [--into DIR2] [--force]
+                                   copy a backup into the data directory (refuses a non-empty one)
   serve                            run the API and dashboard
 
 ASSET is a code or a contract id. Add --json to most commands for machine-readable output,
-or --help (-h) to see this text. Settings come from the environment; see .env.example.`;
+or --help (-h) to see this text. Settings come from the environment; see .env.example.
+
+Exit codes: 0 success, 1 error, 2 open breaks (--fail-on-breaks).`;
