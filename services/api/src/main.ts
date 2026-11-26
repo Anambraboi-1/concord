@@ -55,6 +55,7 @@ export function openRuntime(config: Config): Runtime {
     networks,
     (orgId) => auth.orgExists(orgId),
     () => auth.orgIds(),
+    { syncConcurrency: config.syncConcurrency, syncAssetBudgetMs: config.syncAssetBudgetSec * 1000 },
   );
   return {
     control,
@@ -168,7 +169,7 @@ export function startIndexer(
         for (const r of await tenants.syncAll()) {
           const where = r.assetId ? `${r.orgId}/${r.assetId.slice(0, 8)}` : r.orgId;
           if (r.error) console.error(`sync ${where}: ${r.error}`);
-          else if (r.added) console.log(`sync ${where}: +${r.added} events`);
+          else if (r.added) console.log(`sync ${where}: +${r.added} events${r.more ? " (more next pass)" : ""}`);
         }
       } catch (err) {
         // Nothing here may take the process down; the next pass tries again.
